@@ -1,0 +1,1015 @@
+import streamlit as st
+import json
+import os
+import base64
+import requests
+import math
+import io
+from fpdf import FPDF
+from datetime import datetime
+from dataclasses import dataclass
+from geopy.geocoders import Nominatim
+import folium
+from streamlit_folium import st_folium
+
+st.set_page_config(page_title="PROPIQ | Valuation Report", page_icon="📄", layout="wide")
+
+ALLOWED_IMAGE_TYPES = ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG"]
+
+@dataclass
+class PropertyImage:
+    part: str
+    path: str
+
+    def exists(self) -> bool:
+        return os.path.exists(self.path)
+
+    def remove(self):
+        if self.exists():
+            os.remove(self.path)
+
+
+class UserManager:
+    def __init__(self, filepath: str = "users.json"):
+        self.filepath = filepath
+
+    def _load(self) -> dict:
+        if not os.path.exists(self.filepath):
+            return {}
+        with open(self.filepath, "r") as f:
+            return json.load(f)
+
+    def _save(self, users: dict):
+        with open(self.filepath, "w") as f:
+            json.dump(users, f, indent=4)
+
+    def register(self, username: str, password: str) -> tuple[bool, str]:
+        users = self._load()
+        if username in users:
+            return False, "Username already exists!"
+        users[username] = password
+        self._save(users)
+        return True, "User registered successfully!"
+
+    def login(self, username: str, password: str) -> tuple[bool, str]:
+        users = self._load()
+        if username not in users:
+            return False, "Username does not exist!"
+        if users[username] != password:
+            return False, "Incorrect password!"
+        return True, "Logged in successfully!"
+
+
+class SessionManager:
+    DEFAULTS = {
+        "page": "login",
+        "logged_in": False,
+        "username": "",
+        "google_api_key": "",
+    }
+
+    @classmethod
+    def initialise(cls):
+        for key, value in cls.DEFAULTS.items():
+            if key not in st.session_state:
+                st.session_state[key] = value
+
+    @staticmethod
+    def set(key: str, value):
+        st.session_state[key] = value
+
+    @staticmethod
+    def get(key: str):
+        return st.session_state.get(key)
+
+    @staticmethod
+    def navigate(page: str):
+        st.session_state.page = page
+        st.rerun()
+
+    @staticmethod
+    def logout():
+        st.session_state.logged_in = False
+        st.session_state.username = ""
+        st.session_state.google_api_key = ""
+        st.session_state.page = "login"
+        st.rerun()
+
+
+class UIRenderer:
+    LOGO_URL = "https://www.sjp.ac.lk/wp-content/uploads/2020/10/usjp-logo-300x300.png"
+
+    @staticmethod
+    def inject_css():
+        st.markdown("""
+        <style>
+        body {background-color: #f8f8f8; font-family: 'Segoe UI', sans-serif;}
+        main .block-container {padding-top: 0rem !important; margin-top: 0rem !important;}
+        .header {
+            background: linear-gradient(90deg, #800000, #a52a2a);
+            padding: 25px 20px; border-radius: 15px;
+            text-align: center; box-shadow: 0 3px 15px rgba(0,0,0,0.15);
+        }
+        .header h1 {color: #FFD700; font-size: 40px; font-weight: 800; margin: 0;}
+        .header h4 {color: #fff8dc; font-weight: 500; margin: 5px 0 0;}
+       
+        .card:hover {transform: translateY(-3px); box-shadow: 0 8px 28px rgba(0,0,0,0.1);}
+        .section-title {color: #800000; font-size: 20px; font-weight: 700; margin-bottom: 10px;}
+        label {color: #800000; font-weight: 600;}
+        .stTextInput input, .stTextArea textarea {
+            background-color: #fff; border: 2px solid #80000033;
+            border-radius: 8px; color: black;
+        }
+        .stButton > button {
+            background-color: #800000; color: white;
+            border-radius: 10px; font-weight: 600;
+            padding: 0.6rem 1rem; transition: all 0.25s ease;
+        }
+        .stButton > button:hover {background-color: #DAA520; color: black; transform: scale(1.02);}
+        hr {border: 1px solid #80000033; margin: 20px 0;}
+        .footer {text-align: center; color: #555; font-size: 13px; margin-top: 40px;}
+        </style>
+        """, unsafe_allow_html=True)
+
+    @staticmethod
+    def render_header():
+        st.markdown("""
+        <div class="header">
+            <h1>PROPIQ</h1>
+            <h4>Valuation Report Generator — University of Sri Jayewardenepura</h4>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    @classmethod
+    def render_sidebar(cls):
+        with st.sidebar:
+            st.image(cls.LOGO_URL, width=120)
+            if SessionManager.get("logged_in"):
+                st.markdown(f"**👋 Welcome, {SessionManager.get('username')}**")
+                st.divider()
+                if st.button("🏠 Home"):
+                    SessionManager.navigate("home")
+                if st.button("🚪 Logout"):
+                    SessionManager.logout()
+            else:
+                st.markdown("Please log in to access the system.")
+
+    @staticmethod
+    def render_footer():
+        st.markdown("""
+        <hr>
+        <div class="footer">© 2025 PROPIQ | Developed at the University of Sri Jayewardenepura</div>
+        """, unsafe_allow_html=True)
+
+
+class AuthPage:
+    def __init__(self, user_manager: UserManager):
+        self.user_manager = user_manager
+
+    def render(self):
+        page = SessionManager.get("page")
+        if page == "login":
+            self._render_login()
+        elif page == "register":
+            self._render_register()
+
+    def _render_login(self):
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("🔐 Login to PROPIQ")
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Login", use_container_width=True):
+            success, msg = self.user_manager.login(username, password)
+            if success:
+                SessionManager.set("logged_in", True)
+                SessionManager.set("username", username)
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.info("Don't have an account?")
+        if st.button("🆕 Register as a new member"):
+            SessionManager.navigate("register")
+
+    def _render_register(self):
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("🆕 Register a New Account")
+        username = st.text_input("Create Username", key="reg_username")
+        password = st.text_input("Create Password", type="password", key="reg_password")
+        confirm  = st.text_input("Confirm Password", type="password", key="reg_confirm_password")
+        if st.button("Register", use_container_width=True):
+            if password != confirm:
+                st.error("Passwords do not match!")
+            elif not username or not password:
+                st.error("Enter username and password!")
+            else:
+                success, msg = self.user_manager.register(username, password)
+                if success:
+                    st.success(msg)
+                    SessionManager.navigate("login")
+                else:
+                    st.error(msg)
+        if st.button("🔙 Back to Login"):
+            SessionManager.navigate("login")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+class APIKeyWidget:
+    @staticmethod
+    def render() -> str:
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            key_input = st.text_input(
+                "🔑 Google Gemini API Key",
+                value=SessionManager.get("google_api_key") or "",
+                type="password",
+                placeholder="Paste your API key here  (AIza...)",
+                help="Get your free key at aistudio.google.com → Get API Key",
+                key="api_key_input",
+            )
+            if key_input:
+                SessionManager.set("google_api_key", key_input)
+        with col2:
+            saved_key = SessionManager.get("google_api_key")
+            if saved_key and len(saved_key) > 10:
+                st.success("✅ Key saved")
+            else:
+                st.warning("⚠️ No key")
+        return SessionManager.get("google_api_key") or ""
+
+
+def save_uploaded_image(uploaded_file, dest_path: str) -> bool:
+    """
+    Saves any uploaded image (jpg/png) as a proper JPEG file on disk.
+    Converts PNG with alpha to RGB to ensure fpdf compatibility.
+    Returns True on success.
+    """
+    try:
+        from PIL import Image as PILImage
+        img = PILImage.open(uploaded_file)
+        if img.mode in ("RGBA", "P", "LA"):
+            bg = PILImage.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            bg.paste(img, mask=img.split()[-1] if img.mode == "RGBA" else None)
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        img.save(dest_path, "JPEG", quality=92)
+        return True
+    except Exception:
+        # Fallback: write raw bytes
+        uploaded_file.seek(0)
+        with open(dest_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        return True
+
+
+class ValuationForm:
+    def render(self) -> dict:
+        fields = {}
+
+        with st.expander("📋 General Valuation Information", expanded=True):
+            fields["a) Identification and status of the valuer"] = st.text_input(
+                "a) Identification and status of the valuer")
+            fields["b) Client details"] = st.text_input(
+                "b) Identification of the client and intended users")
+            fields["c) Purpose of the valuation"] = st.text_area("c) Purpose of the valuation")
+            fields["d) Identification of the property"] = st.text_area(
+                "d) Identification of the asset(s) or liability(ies) valued")
+            fields["e) Basis of value adopted"] = st.text_input("e) Basis(es) of value adopted")
+            fields["f) Valuation date"] = st.date_input("f) Valuation date")
+
+        with st.expander("🏗️ Property & Valuation Details"):
+            fields["g) Nature of the property"] = st.text_area("g) Nature of property")
+            fields["h) Site profile"] = st.text_area("h) Site profile (land/building)")
+
+            location_data = self._render_location()
+            if location_data:
+                fields["Location Address"] = location_data.get("address", "")
+                fields["Latitude"]         = location_data.get("lat", "")
+                fields["Longitude"]        = location_data.get("lon", "")
+
+            fields["i) Market value evidence"] = st.text_area("i) Evidence of market values")
+            fields["j) Assumptions and reservations"] = st.text_area("j) Assumptions and special reservations")
+            fields["k) Valuation approach"] = st.text_area("k) Valuation approach and reasoning")
+            fields["l) Amount of valuation"] = st.text_input("l) Amount of valuation (LKR)")
+            fields["m) Date of report"] = st.date_input("m) Date of the valuation report")
+
+        selected_parts = self._render_property_parts()
+        fields["q) Selected Property Parts"] = selected_parts
+
+        property_images = self._render_image_uploads(selected_parts)
+        fields["r) Property Images"] = property_images
+
+        self._render_progress(fields)
+        return fields
+
+    def _render_location(self) -> dict:
+        st.markdown("#### 📍 Property Location (Optional)")
+        st.markdown("Search for the property address to pin on map.")
+
+        if "location_data" not in st.session_state:
+            st.session_state.location_data = {}
+
+        search_input = st.text_input("Enter property name, address, or city:", key="location_search_input")
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            search_button = st.button("🔍 Find Location", key="search_location")
+        with col2:
+            if st.session_state.location_data:
+                st.success(f"Location: {st.session_state.location_data.get('address', '')}")
+
+        if search_button and search_input:
+            with st.spinner("Searching..."):
+                try:
+                    geolocator = Nominatim(user_agent="propiq_valuation_app")
+                    location   = geolocator.geocode(search_input)
+                    if location:
+                        st.session_state.location_data = {
+                            "address": location.address,
+                            "lat":     location.latitude,
+                            "lon":     location.longitude,
+                        }
+                        st.success("Location found!")
+                    else:
+                        st.error("Location not found. Try another name.")
+                        st.session_state.location_data = {}
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                    st.session_state.location_data = {}
+
+        if st.session_state.location_data:
+            lat = st.session_state.location_data["lat"]
+            lon = st.session_state.location_data["lon"]
+            map_preview = folium.Map(location=[lat, lon], zoom_start=15)
+            folium.Marker(
+                [lat, lon],
+                popup=f"<a href='https://www.openstreetmap.org/?mlat={lat}&mlon={lon}&zoom=18' target='_blank'>Open Full Map</a>",
+                tooltip="Click to open full map",
+                icon=folium.Icon(color="red"),
+            ).add_to(map_preview)
+            st_folium(map_preview, width=600, height=400)
+            st.caption(f"Latitude: {lat}, Longitude: {lon}")
+            st.info("✅ This location will also be embedded as a map image in the PDF report.")
+
+        return st.session_state.location_data
+
+    def _render_property_parts(self) -> list[str]:
+        with st.expander("🏠 Property Details"):
+            st.markdown('<div class="section-title">Select Property Parts</div>', unsafe_allow_html=True)
+            part_options = ["Living Room", "Bedroom", "Dining Room", "Open Veranda", "Other"]
+            checked = {p: st.checkbox(p) for p in part_options}
+            other_text = st.text_input("Specify other:", "") if checked.get("Other") else None
+
+        selected = [p for p, v in checked.items() if v and p != "Other"]
+        if other_text:
+            selected.append(other_text)
+        return selected
+
+    def _render_image_uploads(self, selected_parts: list[str]) -> list[PropertyImage]:
+        images: list[PropertyImage] = []
+
+        with st.expander("📷 Property Images"):
+            st.caption("Accepted formats: JPG, JPEG, PNG")
+
+            main_img = st.file_uploader(
+                "Upload main property photo",
+                type=["jpg", "jpeg", "png"],
+                key="main_img"
+            )
+            if main_img:
+                path = "cover_property.jpg"
+                save_uploaded_image(main_img, path)
+                images.append(PropertyImage(part="Subject Property", path=path))
+                st.image(path, caption="Main Property Photo", width=300)
+
+            if selected_parts:
+                for i, part in enumerate(selected_parts, start=1):
+                    img = st.file_uploader(
+                        f"Upload image for: {part}",
+                        type=["jpg", "jpeg", "png"],
+                        key=f"img_{i}"
+                    )
+                    if img:
+                        path = f"property_image_{i}.jpg"
+                        save_uploaded_image(img, path)
+                        images.append(PropertyImage(part=part, path=path))
+                        st.image(path, caption=f"{part}", width=300)
+            else:
+                st.info("Select at least one property part above to upload images.")
+
+        return images
+
+    def _render_progress(self, fields: dict):
+        filled = sum(1 for v in fields.values() if v)
+        total  = len(fields)
+        pct    = int((filled / total) * 100) if total > 0 else 0
+        st.progress(pct)
+        st.caption(f"Form Completion: {pct}%")
+
+
+# =============================================================================
+# PDF HELPERS
+# =============================================================================
+
+PAGE_W      = 210   # A4 width mm
+PAGE_H      = 297   # A4 height mm
+MARGIN      = 15    # page margin mm
+CONTENT_W   = PAGE_W - 2 * MARGIN   # 180 mm usable width
+
+MAROON      = (128, 0, 0)
+GOLD        = (255, 215, 0)
+DARK_GRAY   = (50, 50, 50)
+MID_GRAY    = (100, 100, 100)
+LIGHT_GRAY  = (150, 150, 150)
+CREAM_BG    = (255, 248, 220)
+WHITE       = (255, 255, 255)
+
+
+class PDFReport(FPDF):
+
+    # ── page chrome ────────────────────────────────────────────────────────
+    def header(self):
+        self.set_fill_color(*MAROON)
+        self.rect(0, 0, PAGE_W, 18, "F")
+        self.set_text_color(*GOLD)
+        self.set_font("Arial", "B", 13)
+        self.set_y(4)
+        self.cell(0, 10, "PROPIQ  |  University of Sri Jayewardenepura", ln=True, align="C")
+        self.ln(6)
+
+    def footer(self):
+        self.set_y(-13)
+        self.set_fill_color(*MAROON)
+        self.rect(0, PAGE_H - 13, PAGE_W, 13, "F")
+        self.set_text_color(*GOLD)
+        self.set_font("Arial", "I", 9)
+        self.cell(0, 10, f"Generated by PROPIQ | USJP   |   Page {self.page_no()}", 0, 0, "C")
+
+    # ── reusable drawing helpers ───────────────────────────────────────────
+    def section_heading(self, title: str):
+        """Full-width maroon band with white heading text."""
+        self.set_fill_color(*MAROON)
+        self.set_text_color(*WHITE)
+        self.set_font("Arial", "B", 11)
+        self.cell(CONTENT_W, 8, f"  {title}", ln=True, fill=True)
+        self.ln(2)
+        self.set_text_color(*DARK_GRAY)
+
+    def sub_heading(self, title: str):
+        """Lighter sub-section heading with left accent bar."""
+        self.set_fill_color(200, 180, 180)
+        self.rect(MARGIN, self.get_y(), 2, 6, "F")
+        self.set_x(MARGIN + 4)
+        self.set_text_color(*MAROON)
+        self.set_font("Arial", "B", 10)
+        self.cell(CONTENT_W - 4, 6, title, ln=True)
+        self.ln(1)
+        self.set_text_color(*DARK_GRAY)
+
+    def guidance_text(self, text: str):
+        """Small italic grey guidance/template text."""
+        self.set_text_color(*MID_GRAY)
+        self.set_font("Arial", "I", 9)
+        for line in text.split("\n"):
+            self.multi_cell(CONTENT_W, 5, line.strip())
+        self.ln(1)
+
+    def user_value(self, value):
+        """Bold black user-entered value, or light-grey N/A."""
+        if value and str(value).strip() and str(value).strip() != "N/A":
+            self.set_text_color(*DARK_GRAY)
+            self.set_font("Arial", "B", 10)
+            text = ", ".join(value) if isinstance(value, list) else str(value)
+            self.multi_cell(CONTENT_W, 6, text)
+        else:
+            self.set_text_color(*LIGHT_GRAY)
+            self.set_font("Arial", "I", 9)
+            self.cell(CONTENT_W, 6, "N/A", ln=True)
+        self.ln(3)
+        self.set_text_color(*DARK_GRAY)
+
+    def field_block(self, guidance: str, value):
+        """Render a guidance line followed by the user's answer."""
+        self.guidance_text(guidance)
+        self.user_value(value)
+
+    def divider(self):
+        self.set_draw_color(*MAROON)
+        self.set_line_width(0.2)
+        self.line(MARGIN, self.get_y(), MARGIN + CONTENT_W, self.get_y())
+        self.ln(3)
+
+    def embed_image(self, path: str, caption: str = "", max_w: int = 160):
+        """Embed an image centred on the page with optional caption."""
+        try:
+            from PIL import Image as PILImage
+            with PILImage.open(path) as im:
+                iw, ih = im.size
+            aspect = ih / iw
+            w = min(max_w, CONTENT_W)
+            h = w * aspect
+            # ensure it fits on remaining page
+            if self.get_y() + h + 10 > PAGE_H - 20:
+                self.add_page()
+            x = MARGIN + (CONTENT_W - w) / 2
+            self.image(path, x=x, y=None, w=w)
+            if caption:
+                self.set_font("Arial", "I", 8)
+                self.set_text_color(*MID_GRAY)
+                self.cell(CONTENT_W, 5, caption, ln=True, align="C")
+            self.ln(4)
+        except Exception:
+            self.set_font("Arial", "I", 9)
+            self.set_text_color(*LIGHT_GRAY)
+            self.cell(CONTENT_W, 6, f"[Image unavailable: {caption}]", ln=True)
+            self.ln(2)
+
+    def summary_box(self, text: str):
+        """Cream-coloured box for the AI summary."""
+        self.set_fill_color(*CREAM_BG)
+        self.set_draw_color(*MAROON)
+        self.set_line_width(0.4)
+        lines_est = max(10, len(text) // 90 + 2)
+        box_h = lines_est * 5.5 + 18
+        box_y = self.get_y()
+        if box_y + box_h > PAGE_H - 20:
+            self.add_page()
+            box_y = self.get_y()
+        self.rect(MARGIN, box_y, CONTENT_W, box_h, "DF")
+        self.set_xy(MARGIN + 4, box_y + 5)
+        self.set_text_color(*MAROON)
+        self.set_font("Arial", "B", 10)
+        self.cell(0, 6, "AI-Generated Property Summary  (Google Gemini)", ln=True)
+        self.ln(1)
+        self.set_x(MARGIN + 4)
+        self.set_text_color(30, 30, 30)
+        self.set_font("Arial", "", 9)
+        self.multi_cell(CONTENT_W - 8, 5.2, text)
+        self.ln(5)
+
+
+# =============================================================================
+# AI SUMMARY
+# =============================================================================
+
+class AISummaryGenerator:
+    GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
+    @staticmethod
+    def _sanitize(text: str) -> str:
+        replacements = {
+            "\u2014": "-", "\u2013": "-", "\u2018": "'", "\u2019": "'",
+            "\u201c": '"', "\u201d": '"', "\u2026": "...", "\u00a0": " ",
+            "\u2022": "-", "\u00b7": "-", "\u2012": "-", "\u2015": "-",
+        }
+        for char, rep in replacements.items():
+            text = text.replace(char, rep)
+        return text.encode("latin-1", errors="replace").decode("latin-1")
+
+    @staticmethod
+    def generate(data: dict, api_key: str) -> str:
+        val_date = data.get("f) Valuation date")
+        rep_date = data.get("m) Date of report")
+        parts    = data.get("q) Selected Property Parts", [])
+
+        context = (
+            f"Valuer: {data.get('a) Identification and status of the valuer', 'N/A')}\n"
+            f"Client: {data.get('b) Client details', 'N/A')}\n"
+            f"Purpose of Valuation: {data.get('c) Purpose of the valuation', 'N/A')}\n"
+            f"Property Identification: {data.get('d) Identification of the property', 'N/A')}\n"
+            f"Basis of Value: {data.get('e) Basis of value adopted', 'N/A')}\n"
+            f"Valuation Date: {val_date.strftime('%Y-%m-%d') if val_date else 'N/A'}\n"
+            f"Nature of Property: {data.get('g) Nature of the property', 'N/A')}\n"
+            f"Site Profile: {data.get('h) Site profile', 'N/A')}\n"
+            f"Location: {data.get('Location Address', 'N/A')}\n"
+            f"Market Value Evidence: {data.get('i) Market value evidence', 'N/A')}\n"
+            f"Assumptions & Reservations: {data.get('j) Assumptions and reservations', 'N/A')}\n"
+            f"Valuation Approach: {data.get('k) Valuation approach', 'N/A')}\n"
+            f"Valuation Amount: LKR {data.get('l) Amount of valuation', 'N/A')}\n"
+            f"Date of Report: {rep_date.strftime('%Y-%m-%d') if rep_date else 'N/A'}\n"
+            f"Property Parts Inspected: {', '.join(parts) if parts else 'N/A'}\n"
+        )
+
+        prompt = (
+            "You are a professional Chartered Valuation Surveyor writing an official valuation report.\n\n"
+            "Using ALL of the valuation data provided below, write a comprehensive PROPERTY SUMMARY "
+            "(250 to 300 words) to appear at the end of the valuation report. "
+            "The summary MUST reference and incorporate every piece of information the valuer entered. "
+            "Structure it in flowing prose paragraphs with NO bullet points, covering:\n"
+            "1. Identity of the property and the client\n"
+            "2. Purpose and basis of the valuation\n"
+            "3. Nature and use/occupancy of the property\n"
+            "4. Site characteristics, location and building profile\n"
+            "5. Market value evidence and comparable data\n"
+            "6. Assumptions and reservations applied\n"
+            "7. Valuation approach and methodology\n"
+            "8. Final assessed market value and date\n\n"
+            "Use ONLY plain ASCII characters. Do NOT use em dashes, smart quotes, or special symbols.\n"
+            "Write in formal third-person professional language.\n\n"
+            f"VALUATION DATA:\n{context}"
+        )
+
+        if not api_key or len(api_key) < 10:
+            return "AI summary unavailable: No Google API key provided."
+
+        url     = f"{AISummaryGenerator.GEMINI_API_URL}?key={api_key}"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.2},
+        }
+
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            if resp.status_code in (401, 403):
+                return "AI summary unavailable: Invalid or unauthorised Google API key."
+            if resp.status_code == 400:
+                return f"AI summary unavailable: Bad request. Details: {resp.text[:200]}"
+            resp.raise_for_status()
+            raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            return AISummaryGenerator._sanitize(raw)
+        except requests.exceptions.Timeout:
+            return "AI summary unavailable: Request timed out."
+        except Exception as e:
+            return (
+                "This valuation report presents a professional assessment of the subject property "
+                "as described in the sections above. The valuation has been conducted in accordance "
+                "with recognised valuation standards and reflects prevailing market conditions. "
+                f"[Error: {str(e)}]"
+            )
+
+
+# =============================================================================
+# PDF GENERATOR
+# =============================================================================
+
+class PDFGenerator:
+    LOGO_URL = "https://www.sjp.ac.lk/wp-content/uploads/2020/10/usjp-logo-300x300.png"
+
+    TEMPLATES = {
+        "01": "The purpose of this valuation is to determine the Market Value of the subject property for the intended purpose as described below.",
+        "02": "I inspected the subject property on the date noted below in the presence of the agent of the applicant. The date of inspection is generally accepted as the date of valuation.",
+        "03": "Explain how you identify the property. Includes boundary demarcation/plan and deed particulars. Indicate assessment number and postal address wherever applicable.",
+        "04": "Explain the use of the property and occupancy: e.g., owner-occupied residential, commercial or industrial property.",
+        "05_land": "Explain the geographical features of the land such as shape, terrain, topography, soil condition, elevation, plantation, etc.",
+        "05_building": "Describe the building (roof to foundation). Include internal and external features, floor areas, and a pictorial view of each section.",
+        "06": "Details of evidence on land values, rentals and cost information collected from reliable sources should be given here.",
+        "07": "Assumptions and any special assumptions should be clearly stated. An Assumption is made that a specific investigation is not required to prove something is true.",
+        "08": "This explains the meaning of the value figure reported. Examples: Market Value, Forced Sale Value, Insurance Value (derived from IVS).",
+        "09": "Explain the selected valuation approach and reasoning. This may be the Market approach, Income approach, or Cost approach.",
+        "10": (
+            "Prepared by the valuer. The valuation was done according to the standards. "
+            "This report is confidential to the client and is not to be used by any other party.\n\n"
+            "Yours Sincerely,\n\n{valuer_name}\nChartered Valuation Surveyor\n\n"
+            "Date of Report: {date_of_report}\n\n"
+            "DISCLAIMER: This template is intended as a general framework only."
+        ),
+    }
+
+    def generate(self, data: dict, api_key: str) -> str:
+        pdf = PDFReport()
+        pdf.set_margins(MARGIN, MARGIN, MARGIN)
+        pdf.set_auto_page_break(auto=True, margin=18)
+        ai_summary = AISummaryGenerator.generate(data, api_key)
+        self._build_cover_page(pdf, data)
+        pdf.add_page()
+        self._build_report_sections(pdf, data, ai_summary)
+        report_id = datetime.now().strftime("PROPIQ-%Y%m%d-%H%M%S")
+        filename  = f"valuation_report_{report_id}.pdf"
+        pdf.output(filename)
+        return filename
+
+    # ── cover page ─────────────────────────────────────────────────────────
+    def _build_cover_page(self, pdf: PDFReport, data: dict):
+        pdf.add_page()
+
+        # Logo
+        try:
+            pdf.image(self.LOGO_URL, x=(PAGE_W - 35) / 2, y=30, w=35)
+        except Exception:
+            pass
+        pdf.ln(55)
+
+        # Title band
+        pdf.set_fill_color(*MAROON)
+        pdf.set_text_color(*GOLD)
+        pdf.set_font("Arial", "B", 22)
+        pdf.cell(CONTENT_W, 14, "VALUATION REPORT", ln=True, fill=True, align="C")
+        pdf.ln(6)
+
+        # Valuation amount
+        amount = data.get("l) Amount of valuation", "")
+        if amount:
+            pdf.set_font("Arial", "B", 18)
+            pdf.set_text_color(*MAROON)
+            pdf.cell(CONTENT_W, 10, f"LKR  {amount}", ln=True, align="C")
+        pdf.set_font("Arial", "I", 10)
+        pdf.set_text_color(*MID_GRAY)
+        pdf.cell(CONTENT_W, 6, "The term of currency is Sri Lankan Rupees", ln=True, align="C")
+        pdf.ln(6)
+
+        # Reference / date row
+        report_id = datetime.now().strftime("PROPIQ-%Y%m%d-%H%M%S")
+        val_date  = data.get("f) Valuation date")
+        pdf.set_font("Arial", "", 10)
+        pdf.set_text_color(*MID_GRAY)
+        pdf.cell(CONTENT_W / 2, 6, f"Reference: {report_id}", ln=False, align="L")
+        pdf.cell(CONTENT_W / 2, 6,
+                 f"Valuation Date: {val_date.strftime('%d %B %Y') if val_date else 'N/A'}",
+                 ln=True, align="R")
+        pdf.ln(4)
+
+        # Thin divider
+        pdf.set_draw_color(*MAROON)
+        pdf.set_line_width(0.4)
+        pdf.line(MARGIN, pdf.get_y(), MARGIN + CONTENT_W, pdf.get_y())
+        pdf.ln(6)
+
+        # Valuer / client info box
+        pdf.set_fill_color(250, 245, 245)
+        pdf.set_draw_color(*MAROON)
+        pdf.set_line_width(0.3)
+        pdf.rect(MARGIN, pdf.get_y(), CONTENT_W, 22, "DF")
+        y0 = pdf.get_y() + 4
+        pdf.set_xy(MARGIN + 4, y0)
+        pdf.set_font("Arial", "B", 9)
+        pdf.set_text_color(*MAROON)
+        pdf.cell(CONTENT_W / 2 - 4, 5, "PREPARED BY", ln=False)
+        pdf.cell(CONTENT_W / 2 - 4, 5, "PREPARED FOR", ln=True)
+        pdf.set_x(MARGIN + 4)
+        pdf.set_font("Arial", "", 9)
+        pdf.set_text_color(*DARK_GRAY)
+        valuer  = data.get("a) Identification and status of the valuer", "N/A")
+        client  = data.get("b) Client details", "N/A")
+        pdf.cell(CONTENT_W / 2 - 4, 5,
+                 valuer[:55] + ("..." if len(valuer) > 55 else ""), ln=False)
+        pdf.cell(CONTENT_W / 2 - 4, 5,
+                 client[:55] + ("..." if len(client) > 55 else ""), ln=True)
+        pdf.ln(16)
+
+        # Main property image (centred, max 140 mm wide)
+        images: list[PropertyImage] = data.get("r) Property Images", [])
+        if images and images[0].exists():
+            pdf.embed_image(images[0].path, caption="Subject Property", max_w=140)
+
+    # ── report sections ────────────────────────────────────────────────────
+    def _build_report_sections(self, pdf: PDFReport, data: dict, ai_summary: str = ""):
+        t = self.TEMPLATES
+
+        pdf.section_heading("01.0  PURPOSE OF VALUATION")
+        pdf.field_block(t["01"], data.get("c) Purpose of the valuation"))
+        pdf.divider()
+
+        pdf.section_heading("02.0  DATE OF INSPECTION")
+        val_date = data.get("f) Valuation date")
+        pdf.field_block(t["02"], val_date.strftime("%d %B %Y") if val_date else None)
+        pdf.divider()
+
+        pdf.section_heading("03.0  IDENTIFICATION OF PROPERTY")
+        pdf.field_block(t["03"], data.get("d) Identification of the property"))
+        pdf.divider()
+
+        pdf.section_heading("04.0  NATURE OF PROPERTY")
+        pdf.field_block(t["04"], data.get("g) Nature of the property"))
+        pdf.divider()
+
+        pdf.section_heading("05.0  SITE PROFILE")
+        pdf.sub_heading("05.1  Land")
+        pdf.field_block(t["05_land"], data.get("h) Site profile"))
+        pdf.sub_heading("05.2  Building")
+        pdf.field_block(t["05_building"], None)
+
+        # Property part images (skip cover image — already on cover)
+        images: list[PropertyImage] = data.get("r) Property Images", [])
+        for img in images[1:]:
+            if img.exists():
+                pdf.embed_image(img.path, caption=img.part, max_w=155)
+
+        # Location map
+        self._insert_location_map(pdf, data)
+        pdf.divider()
+
+        pdf.section_heading("06.0  EVIDENCE OF MARKET VALUES")
+        pdf.field_block(t["06"], data.get("i) Market value evidence"))
+        pdf.divider()
+
+        pdf.section_heading("07.0  ASSUMPTION AND RESERVATION")
+        pdf.field_block(t["07"], data.get("j) Assumptions and reservations"))
+        pdf.divider()
+
+        pdf.section_heading("08.0  BASIS OF VALUATION")
+        pdf.field_block(t["08"], data.get("e) Basis of value adopted"))
+        pdf.divider()
+
+        pdf.section_heading("09.0  VALUATION APPROACH AND REASONING")
+        pdf.field_block(t["09"], data.get("k) Valuation approach"))
+        pdf.divider()
+
+        pdf.section_heading("10.0  CERTIFICATE")
+        valuer       = data.get("a) Identification and status of the valuer", "__________")
+        rep_date     = data.get("m) Date of the valuation report")
+        rep_date_str = rep_date.strftime("%d %B %Y") if rep_date else "__________"
+        cert_text    = t["10"].format(valuer_name=valuer, date_of_report=rep_date_str)
+        for line in cert_text.split("\n"):
+            pdf.set_font("Arial", "", 10)
+            pdf.set_text_color(*DARK_GRAY)
+            pdf.multi_cell(CONTENT_W, 6, line.strip())
+        pdf.ln(4)
+
+        # ── Section 11: AI Summary ────────────────────────────────────────
+        pdf.add_page()
+        pdf.section_heading("11.0  PROPERTY SUMMARY")
+        pdf.guidance_text(
+            "The following summary has been automatically generated by Google Gemini AI based on all "
+            "information entered in this valuation report. It consolidates and presents the key "
+            "details across all sections in a professional narrative format."
+        )
+        pdf.ln(2)
+        if ai_summary:
+            pdf.summary_box(ai_summary)
+        else:
+            pdf.user_value("No summary available.")
+
+        pdf.ln(4)
+        pdf.set_font("Arial", "B", 9)
+        pdf.set_text_color(*MAROON)
+        pdf.cell(CONTENT_W, 6,
+                 f"Generated on: {datetime.now().strftime('%d %B %Y  %H:%M:%S')}",
+                 ln=True, align="R")
+
+    # ── location map ───────────────────────────────────────────────────────
+    def _insert_location_map(self, pdf: PDFReport, data: dict):
+        try:
+            from PIL import Image as PILImage, ImageDraw
+        except ImportError:
+            return
+
+        lat     = data.get("Latitude")
+        lon     = data.get("Longitude")
+        address = data.get("Location Address", "")
+        if not lat or not lon:
+            return
+
+        pdf.sub_heading("05.3  Property Location Map")
+        pdf.set_text_color(*MID_GRAY)
+        pdf.set_font("Arial", "", 9)
+        if address:
+            safe = address.encode("latin-1", errors="replace").decode("latin-1")
+            pdf.multi_cell(CONTENT_W, 5, f"Address: {safe}")
+        pdf.multi_cell(CONTENT_W, 5, f"Coordinates: {lat:.6f} N,  {lon:.6f} E")
+        pdf.ln(3)
+
+        zoom      = 15
+        tile_size = 256
+        grid      = 3
+
+        def deg2tile(la, lo, z):
+            n  = 2 ** z
+            tx = int((lo + 180.0) / 360.0 * n)
+            ty = int((1.0 - math.asinh(math.tan(math.radians(la))) / math.pi) / 2.0 * n)
+            return tx, ty
+
+        def coord2px(la, lo, z, ox, oy):
+            n  = 2 ** z
+            px = (lo + 180.0) / 360.0 * n * tile_size - ox * tile_size
+            py = (1.0 - math.asinh(math.tan(math.radians(la))) / math.pi) / 2.0 * n * tile_size - oy * tile_size
+            return int(px), int(py)
+
+        cx, cy = deg2tile(lat, lon, zoom)
+        half   = grid // 2
+        canvas = PILImage.new("RGB", (tile_size * grid, tile_size * grid), (210, 210, 210))
+        hdrs   = {"User-Agent": "PROPIQ-ValuationApp/1.0"}
+
+        for row in range(grid):
+            for col in range(grid):
+                url = f"https://tile.openstreetmap.org/{zoom}/{cx-half+col}/{cy-half+row}.png"
+                try:
+                    r = requests.get(url, headers=hdrs, timeout=10)
+                    if r.status_code == 200:
+                        tile = PILImage.open(io.BytesIO(r.content)).convert("RGB")
+                        canvas.paste(tile, (col * tile_size, row * tile_size))
+                except Exception:
+                    pass
+
+        # Marker
+        px, py = coord2px(lat, lon, zoom, cx - half, cy - half)
+        draw   = ImageDraw.Draw(canvas)
+        for radius, colour in [(14, MAROON), (10, (220, 30, 30)), (4, WHITE)]:
+            draw.ellipse([px - radius, py - radius, px + radius, py + radius], fill=colour)
+        draw.rectangle([0, 0, canvas.width-1, canvas.height-1], outline=MAROON, width=4)
+
+        map_path = "location_map_pdf.png"
+        canvas.save(map_path)
+
+        try:
+            w = CONTENT_W
+            pdf.image(map_path, x=MARGIN, y=None, w=w)
+            pdf.ln(2)
+            pdf.set_font("Arial", "I", 8)
+            pdf.set_text_color(*LIGHT_GRAY)
+            pdf.cell(CONTENT_W, 5, "Map data (c) OpenStreetMap contributors", ln=True, align="C")
+            pdf.ln(3)
+        except Exception as e:
+            pdf.guidance_text(f"Map could not be rendered: {e}")
+        finally:
+            try:
+                os.remove(map_path)
+            except Exception:
+                pass
+
+    def cleanup(self, pdf_path: str, images: list[PropertyImage]):
+        try:
+            os.remove(pdf_path)
+        except Exception:
+            pass
+        for img in images:
+            img.remove()
+
+
+# =============================================================================
+# DASHBOARD
+# =============================================================================
+
+class DashboardPage:
+    def __init__(self, pdf_generator: PDFGenerator):
+        self.form          = ValuationForm()
+        self.api_widget    = APIKeyWidget()
+        self.pdf_generator = pdf_generator
+
+    def render(self):
+        username = SessionManager.get("username")
+        st.markdown(f"<h3 style='color:#800000;'>Welcome, {username}! 👋</h3>",
+                    unsafe_allow_html=True)
+        api_key = self.api_widget.render()
+
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Valuation Report Form</div>',
+                    unsafe_allow_html=True)
+        fields = self.form.render()
+
+        if st.button("📄 Generate PDF Report", use_container_width=True):
+            if not api_key or len(api_key) < 10:
+                st.error("⚠️ Please enter your Google Gemini API key above before generating.")
+            else:
+                self._handle_pdf_generation(fields, api_key)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    def _handle_pdf_generation(self, fields: dict, api_key: str):
+        with st.spinner("✨ Generating AI property summary and building your report..."):
+            pdf_path = self.pdf_generator.generate(fields, api_key)
+
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+            b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+
+        st.success("✅ Report generated successfully!")
+
+        with st.expander("📑 Preview Generated PDF", expanded=True):
+            st.markdown(
+                f'<iframe src="data:application/pdf;base64,{b64}" '
+                f'width="100%" height="750"></iframe>',
+                unsafe_allow_html=True,
+            )
+
+        st.download_button(
+            label="⬇️ Download Valuation Report PDF",
+            data=pdf_bytes,
+            file_name=os.path.basename(pdf_path),
+            mime="application/pdf",
+            use_container_width=True,
+        )
+        images: list[PropertyImage] = fields.get("r) Property Images", [])
+        self.pdf_generator.cleanup(pdf_path, images)
+
+
+# =============================================================================
+# APP
+# =============================================================================
+
+class PropiqApp:
+    def __init__(self):
+        self.user_manager   = UserManager()
+        self.pdf_generator  = PDFGenerator()
+        self.ui             = UIRenderer()
+        self.auth_page      = AuthPage(self.user_manager)
+        self.dashboard_page = DashboardPage(self.pdf_generator)
+
+    def run(self):
+        SessionManager.initialise()
+        self.ui.inject_css()
+        self.ui.render_header()
+        self.ui.render_sidebar()
+        if SessionManager.get("logged_in"):
+            self.dashboard_page.render()
+        else:
+            self.auth_page.render()
+        self.ui.render_footer()
+
+
+if __name__ == "__main__" or True:
+    app = PropiqApp()
+    app.run()
